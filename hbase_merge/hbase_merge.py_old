@@ -1,0 +1,196 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# zhaigy@ucweb.com
+# 2010-07
+# 2010-09 根据辛勇建议，重大修改
+
+import sys
+sys.path.append("../jk_hbase_api")
+
+import time
+import os
+
+from JKHBase import JKHBase
+
+"""
+汇总数据，从分钟数据汇总成小时数据，或者从小时数据汇
+总成日数据。
+
+从低级表读入数据，汇总后，写入高级表。
+
+汇总操作，有求平均值和加和值两种，为了兼容，汇总表中
+的数据值更改为字符串，格式为：sum/count
+
+本程序设计为定时启动运行。
+本程序可以使用不同参数并发运行，但是即便是相同参数也
+不会有不良影响。
+
+输入参数：
+-type:m2h/h2d   -- 分钟数据转为小时数据，小时数据转为日数据
+-date:20120614  -- 要统计的日期
+-hour:11        -- 要统计的小时，仅对m2h有效
+
+文件会先被添加后缀标记，然后才会被处理，如果处理过程
+中发生异常，这个带后缀的文件会被留下，问题修复后，简
+单更名去掉后缀标记，重新运行即可
+"""
+
+logs_dir = "./logs"
+
+_type = None
+_date = None    "20120614"
+_hour = None    "11"
+
+_jkids = []
+
+def read_jkids():
+    global _jkids
+    table = JKHBase.getTable("t_jkid")
+    rows = table.read(None, None, 0, time.time())
+    for row in rows:
+        _jkids.append(row['jkid'])
+
+def error_log(msg):
+    logFile = "%s/error.log" % logs_dir
+    f = open(logFile,"a+")
+    timeStr = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    line = "%s: %s" % (timeStr, msg)
+    print line
+    f.write(line)
+    f.write('\n')
+    f.close()
+
+def main():
+    usage = "usage: hbase_merge.py -type m2h/h2d -date 20120614 [-hour 11]"
+    argvLen = len(sys.argv)
+    i = 1
+    while i < argvLen:
+        param = sys.argv[i]
+        if param == '-type':
+            _type = sys.argv[i+1]
+        elif param == '-date':
+            _date = sys.argv[i+1]
+        elif param == '-hour'
+            _hour = sys.argv[i+1]
+        else:
+            print "Error: invalid params:%s" % param
+            print usage
+            sys.exit(1)
+        i += 2
+
+    if _type is None or _date is None \
+       or (_hour is None and _type == 'm2h'):
+        print "Error: invalid params:%s" % param
+        print usage
+        sys.exit(1)
+   
+    error_log("start")
+   
+    fromTableName = "t_m1"
+    toTableName = "t_h1"
+    if _type == 'h2d':
+        fromTableName = "t_h1"
+        toTableName = "t_d1"
+
+    read_jkids()
+
+    fromTable = JKHBase.getTable(fromTableName)
+    toTable = JKHBase.getTable(fromTableName)
+
+    startTime = None
+    endTime = None
+    keyTime = None
+
+    if _type == 'm2h':
+        startTime = time.strptime("%Y%m%d%H%M", "%s%s00" % (_date, _hour))
+        endTime = time.strptime("%Y%m%d%H%M", "%s%s59" % (_date, _hour))
+        keyTime = "%s%s" % (_date, _hour)
+    else: #h2d
+        startTime = time.strptime("%Y%m%d%H", "%s00" % _date)
+        endTime = time.strptime("%Y%m%d%H", "%s23" % _date)
+        keyTime = "%s" % _date
+
+    for jkid in _jkids:
+        rows = fromTable.read(jkid, None, startTime, endTime)
+        #return: [{jkid:12345, keyTime:201206141130, time:20120614113001, columns:{key1:value1, key2:value2}},...] 
+
+        #{status:v,key:[value_sum,value_count],key2:[...]...}
+        mergeMap = {}
+
+        if _type == 'm2h':
+            #从分钟到小时的汇总
+            first_err_time = None
+            prev_status = None
+            #prev_status_time = time.mktime(startTime)
+            prev_status_time = None
+            mergeMap['status'] = 0
+
+            # 错误时间，从第一个错误开始，到后续检查对一个正常结束
+            for row in rows:
+                for k in row.columns:
+                    if k == 'status':
+                        curr_status = row.columns[k]
+                        if curr_status == '2': 
+                            #异常状态
+                            if row is rows[0]:
+                                #第一个就是异常状态，把起始时间作为错误开始时间
+                                first_err_time = time.mktime(startTime)
+                            elif first_err_time is None: 
+                                first_err_time = time.mktime(time.strptime("%Y%m%d%H%M%S", row.time))
+                            else:
+                                #之前已经是异常状态了，不用处理
+                                pass
+                        else: 
+                            #非异常状态，
+                            if first_err_time is not None : 
+                                #如果之前是异常状态，可以结算了
+                                curr_status_time = time.mktime(time.strptime("%Y%m%d%H%M%S", row.time))
+                                mergeMap[k] += curr_status_time - first_err_time
+                                first_err_time = None
+                            else: 
+                                #之前是非异常状态，不需要处理
+                                pass
+                        continue
+
+                    if k not in mergeMap:
+                        mergeMap[k] = [0, 0]
+
+                    mergeMap[k][0] += row.columns[k]
+                    mergeMap[k][1] += 1
+            if first_err_time is not None: 
+                #最后一个是异常，把结束时间当做最后一次结算时间
+                curr_status_time = time.mktime(time.strptime("%Y%m%d%H%M%S", row.time))
+                mergeMap['status'] += curr_status_time - first_err_time
+                first_err_time = None
+                
+        else: 
+            #h2d
+            #{key:[value_sum,value_count],key2:[...]...}
+            #mergeMap = {}
+            #从小时到天的汇总
+            for row in rows:
+                for k in row.columns:
+                    if k not in mergeMap:
+                        mergeMap[k] = [0, 0]
+                    average = row.columns[k]
+                    mergeMap[k][0] += average 
+                    mergeMap[k][1] += 1 
+
+        #merge ok
+        line = "jkid=%s`time=%s|" % (jkid, keyTime)
+        isFirst = True
+        for k in mergeMap:
+            if isFirst:
+                isFirst = False
+            else:
+                line += "`"
+            
+            line += "%s=%f" % (k, mergeMap[k][0], mergeMap[k][1])
+
+        print "line=", line
+        toTable.write(line)
+    
+    #end for
+
+if __name__ == "__main__":
+    main()
